@@ -3,6 +3,7 @@ import time
 import os
 import json
 from datetime import datetime
+from dotenv import load_dotenv
 import google.generativeai as genai
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -10,21 +11,24 @@ from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
 import requests
 
+load_dotenv()
+
 # Import your PPTGenerator class here
 class PPTGenerator:
     def __init__(self, api_key=None, pexel_key=None):
-        self.api_key = api_key
-        self.pexel_key = pexel_key
+        self.api_key = api_key or os.getenv('api_key') or os.getenv('GEMINI_API_KEY')
+        self.pexel_key = pexel_key or os.getenv('PEXEL_API_KEY') or os.getenv('PEXELS_API_KEY')
         
         if not self.api_key:
-            raise ValueError('Gemini API key is not available')
+            raise ValueError('Gemini API key is not available. Set it in the sidebar or .env as api_key / GEMINI_API_KEY.')
 
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel('gemini-2.5-pro')
         self.presentation = Presentation()
+        self.image_session = requests.Session()
         
         self.last_api_call = 0
-        self.min_delay = 30
+        self.min_delay = 20
         self.api_call_count = 0
 
     def _wait_for_rate_limit(self):
@@ -80,10 +84,12 @@ class PPTGenerator:
           {{
             "title": "Slide Title",
             "content": "Main content points as bullet points",
-            "slide_type": "title | content | image | conclusion"
+            "slide_type": "title | content | image | conclusion",
+            "image_query": "A short image search phrase or empty string"
           }}
         ]
-        Make sure the content is engaging, informative, and well-structured.
+        Use a short image_query only for slides that should display an image.
+        For title and conclusion slides, image_query should be an empty string.
         The response must be a valid JSON array.
         """
 
@@ -98,15 +104,20 @@ class PPTGenerator:
                 raise ValueError("Failed to generate content after retries")
 
             if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
+                content = content.split("```json", 1)[1]
+                content = content.split("```", 1)[0].strip()
             elif "```" in content:
-                content = content.split("```")[1].strip()
+                content = content.split("```", 1)[1].strip()
 
-            if not content.startswith('['):
+            if not content.strip().startswith('['):
                 st.warning("Gemini did not return JSON. Using fallback content.")
                 return self._get_fallback_content(topic)
 
-            return json.loads(content)
+            outlines = json.loads(content)
+            for item in outlines:
+                if 'image_query' not in item:
+                    item['image_query'] = ''
+            return outlines
 
         except Exception as e:
             st.error(f"Error generating content: {e}")
@@ -162,12 +173,15 @@ class PPTGenerator:
             return 'professional presentation visual'
 
     def download_images(self, query, save_path='temp_image.jpg'):
+        if not self.pexel_key or not query:
+            return None
+
         try:
             url = 'https://api.pexels.com/v1/search'
             header = {'Authorization': self.pexel_key}
             params = {'query': query, 'per_page': 1, 'orientation': 'landscape'}
 
-            response = requests.get(url, headers=header, params=params)
+            response = self.image_session.get(url, headers=header, params=params, timeout=20)
             response.raise_for_status()
 
             data = response.json()
@@ -175,7 +189,7 @@ class PPTGenerator:
                 raise ValueError('No photo found')
 
             image_url = data['photos'][0]['src']['original']
-            image_response = requests.get(image_url)
+            image_response = self.image_session.get(image_url, timeout=20)
             image_response.raise_for_status()
 
             with open(save_path, 'wb') as f:
@@ -205,7 +219,7 @@ class PPTGenerator:
             subtitle_shape.text_frame.paragraphs[0].font.color.rgb = RGBColor(0, 0, 0)
             subtitle_shape.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
 
-    def create_content_slide(self, title, content, include_image=False):
+    def create_content_slide(self, title, content, include_image=False, image_query=None):
         slide_layout = self.presentation.slide_layouts[1]
         slide = self.presentation.slides.add_slide(slide_layout)
 
@@ -228,9 +242,9 @@ class PPTGenerator:
         p.font.size = Pt(18)
         p.font.color.rgb = RGBColor(0, 0, 0)
 
-        if include_image:
+        if include_image and self.pexel_key:
             try:
-                image_desc = self.generative_image_description(content_text)
+                image_desc = image_query or self.generative_image_description(content_text)
                 if image_desc:
                     image_path = self.download_images(image_desc)
                     if image_path and os.path.exists(image_path):
@@ -241,7 +255,7 @@ class PPTGenerator:
 
         return slide
 
-    def create_image_slide(self, title, content, image_query):
+    def create_image_slide(self, title, content, image_query=None, include_image=True):
         slide_layout = self.presentation.slide_layouts[8]
         slide = self.presentation.slides.add_slide(slide_layout)
 
@@ -269,23 +283,27 @@ class PPTGenerator:
             paragraph.font.color.rgb = RGBColor(51, 51, 51)
             paragraph.alignment = PP_ALIGN.CENTER
 
-        try:
-            image_path = self.download_images(image_query)
-            if image_path and os.path.exists(image_path):
-                slide.shapes.add_picture(image_path, Inches(3.25), Inches(4), width=Inches(3.5), height=Inches(2.5))
-                os.remove(image_path)
-        except Exception as e:
-            st.warning(f"Error adding image to slide: {e}")
+        if include_image and self.pexel_key and image_query:
+            try:
+                image_path = self.download_images(image_query)
+                if image_path and os.path.exists(image_path):
+                    slide.shapes.add_picture(image_path, Inches(3.25), Inches(4), width=Inches(3.5), height=Inches(2.5))
+                    os.remove(image_path)
+            except Exception as e:
+                st.warning(f"Error adding image to slide: {e}")
 
         return slide
 
-    def generate_ppt(self, topic, num_slides=6, output_file='presentation.pptx', author='Pranab'):
+    def generate_ppt(self, topic, num_slides=6, output_file='presentation.pptx', author='Pranab', include_images=True):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         status_text.text(f"Starting PPT generation for: {topic}")
         st.info(f"Total slides: {num_slides}")
-        st.info(f"Estimated time: ~{num_slides * 30 // 60} minutes (due to rate limits)")
+        if include_images and self.pexel_key:
+            st.info("Images will be downloaded for relevant slides.")
+        else:
+            st.info("Skipping image downloads to speed up generation.")
         
         content_outlines = self.generate_content_outlines(topic, num_slides)
         total_slides = len(content_outlines)
@@ -294,6 +312,7 @@ class PPTGenerator:
             title = slide_data.get('title', f"Slide {i+1}")
             content = slide_data.get('content', "")
             slide_type = slide_data.get('slide_type', 'content')
+            image_query = slide_data.get('image_query', '')
 
             status_text.text(f"📄 Generating slide {i+1}/{total_slides}: {title}")
             progress_bar.progress((i + 1) / total_slides)
@@ -301,17 +320,14 @@ class PPTGenerator:
             if i == 0 or slide_type == 'title':
                 self.create_title_slide(title, f'Created by {author}')
             elif slide_type == 'content':
-                self.create_content_slide(title, content, include_image=True)
+                self.create_content_slide(title, content, include_image=include_images, image_query=image_query)
             elif slide_type == 'image':
-                content_str = '\n'.join(content) if isinstance(content, list) else str(content)
-                img_query = self.generative_image_description(content_str)
-                self.create_image_slide(title, content, img_query)
+                self.create_image_slide(title, content, image_query=image_query, include_image=include_images)
             else:
-                self.create_content_slide(title, content, include_image=False)
+                self.create_content_slide(title, content, include_image=include_images, image_query=image_query)
 
         self.presentation.save(output_file)
         status_text.text(f"PPT generated successfully!")
-        
         
         return output_file
 
@@ -426,8 +442,8 @@ def main():
             st.error("Please provide your Gemini API key in the sidebar!")
             return
         
-        if not pexel_api_key:
-            st.error("Please provide your Pexels API key in the sidebar!")
+        if include_images and not pexel_api_key:
+            st.error("Please provide your Pexels API key in the sidebar to download images.")
             return
         
         # Generate presentation
@@ -439,10 +455,10 @@ def main():
                     topic=topic,
                     num_slides=num_slides,
                     output_file=output_filename,
-                    author=author_name
+                    author=author_name,
+                    include_images=include_images
                 )
-                
-                # Download button
+
                 with open(output_file, "rb") as file:
                     st.download_button(
                         label="Download Presentation",
@@ -450,8 +466,7 @@ def main():
                         file_name=output_filename,
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
                     )
-                
-                st.balloons()
+
                 
         except Exception as e:
             st.error(f"An error occurred: {str(e)}")
